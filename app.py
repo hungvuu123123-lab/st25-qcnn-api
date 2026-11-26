@@ -1,4 +1,4 @@
-import io, os, base64, cv2, torch, joblib
+import io, os, gc, base64, cv2, torch, joblib
 import numpy as np
 import torch.nn as nn
 import pennylane as qml
@@ -11,14 +11,15 @@ pillow_heif.register_heif_opener()
 device = torch.device("cpu")
 scaler = joblib.load("feature_scaler.pkl")
 
-n_qubits, q_layers = 4, 2
+n_qubits, q_layers = 6, 2
 dev = qml.device("default.qubit", wires=n_qubits)
 
 @qml.qnode(dev, interface="torch")
 def quantum_circuit(inputs, weights):
-    for i in range(n_qubits):
-        qml.RY(inputs[:, i] * np.pi, wires=i)
+    # Cấu trúc Data Re-uploading khớp 100% với bản huấn luyện 6-Qubit trên Colab
     for l in range(q_layers):
+        for i in range(n_qubits):
+            qml.RY(inputs[:, i] * np.pi, wires=i)
         for i in range(n_qubits):
             qml.RY(weights[l, i, 0], wires=i)
             qml.RZ(weights[l, i, 1], wires=i)
@@ -56,7 +57,7 @@ app = FastAPI()
 
 @app.get("/")
 def health_check():
-    return {"status": "ST25 Hybrid QCNN API is running on Render"}
+    return {"status": "ST25 Hybrid QCNN (6-Qubit VQC) API is running on Render"}
 
 @app.post("/analyze")
 async def analyze_rice(file: UploadFile = File(...)):
@@ -79,9 +80,7 @@ async def analyze_rice(file: UploadFile = File(...)):
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=2)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    valid_grains = []
-    areas = []
-
+    valid_grains, areas = [], []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < 400 or area > 35000:
@@ -141,8 +140,14 @@ async def analyze_rice(file: UploadFile = File(...)):
     morph_scaled = scaler.transform(np.array(grain_morphs))
     morph_tensor = torch.tensor(morph_scaled, dtype=torch.float32).to(device)
 
+    # Chia nhỏ lô 16 hạt để giữ mức RAM ~250MB, chống lỗi 502 khi bấm phân tích liên tục
+    probs_list = []
     with torch.no_grad():
-        probs = torch.sigmoid(model(img_tensor, morph_tensor)).cpu().numpy()
+        for start in range(0, total_grains, 16):
+            end = start + 16
+            batch_probs = torch.sigmoid(model(img_tensor[start:end], morph_tensor[start:end])).cpu().numpy()
+            probs_list.append(batch_probs)
+    probs = np.concatenate(probs_list, axis=0)
 
     st25_count = 0
     confidences = []
@@ -162,6 +167,9 @@ async def analyze_rice(file: UploadFile = File(...)):
 
     _, buffer = cv2.imencode('.jpg', annotated_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
     img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+    del img_tensor, morph_tensor, grain_imgs, pil_img, img_bgr, img, gray, blurred, thresh
+    gc.collect()
 
     return {
         "purity_percent": purity_pct,
