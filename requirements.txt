@@ -6,5 +6,6 @@ pillow-heif
 opencv-python-headless
 numpy
 joblib
+scikit-learn
 torch --index-url https://download.pytorch.org/whl/cpu
 pennylane
