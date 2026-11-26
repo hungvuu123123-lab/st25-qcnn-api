@@ -67,8 +67,11 @@ async def analyze_rice(file: UploadFile = File(...)):
     target_w = 1200
     img = cv2.resize(img_bgr, (target_w, int(h * (target_w / float(w)))), interpolation=cv2.INTER_AREA)
 
-    if np.mean(img[:, :int(target_w * 0.15)]) > 110:
-        img = img[:, int(target_w * 0.22):]
+    # Chỉ cắt lề trái nếu thực sự có dải thước trắng chiếm phần lớn chiều cao mép trái
+    left_strip = cv2.cvtColor(img[:, :int(target_w * 0.16)], cv2.COLOR_BGR2GRAY)
+    bright_ratio = np.mean(left_strip > 130)
+    if bright_ratio > 0.65:
+        img = img[:, int(target_w * 0.23):]
 
     annotated_img = img.copy()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -77,15 +80,22 @@ async def analyze_rice(file: UploadFile = File(...)):
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=2)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    grain_imgs, grain_morphs, grain_boxes, aspect_ratios = [], [], [], []
+    valid_grains = []
+    areas = []
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 450 or area > 7500:
+        # Nới rộng ngưỡng diện tích (400 - 35000 px) để nhận diện tốt cả ảnh có thước lẫn ảnh đã cắt thước
+        if area < 400 or area > 35000:
             continue
+
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if x <= 4 or y <= 4 or (x + bw) >= (img.shape[1] - 4) or (y + bh) >= (img.shape[0] - 4):
+        # Loại bỏ các dải viền vàng mỏng chạy dọc sát mép trên/phải của tấm nền đen
+        if bw > img.shape[1] * 0.6 or bh > img.shape[0] * 0.6:
             continue
+        if x <= 2 or y <= 2 or (x + bw) >= (img.shape[1] - 2) or (y + bh) >= (img.shape[0] - 2):
+            continue
+
         rect = cv2.minAreaRect(cnt)
         major_axis, minor_axis = max(rect[1]), min(rect[1])
         if minor_axis == 0:
@@ -94,6 +104,20 @@ async def analyze_rice(file: UploadFile = File(...)):
         if ar < 1.8 or ar > 6.5:
             continue
 
+        valid_grains.append((cnt, area, x, y, bw, bh, ar))
+        areas.append(area)
+
+    total_grains = len(valid_grains)
+    if total_grains == 0:
+        return {"error": "Không phát hiện được hạt gạo nào. Vui lòng chụp trên nền đen rõ nét!"}
+
+    # Tự động chuẩn hóa diện tích về thang đo huấn luyện (~3000 px) bất kể khoảng cách chụp hay cắt ảnh
+    median_area = float(np.median(areas))
+    area_scale = 3000.0 / median_area if median_area > 0 else 1.0
+
+    grain_imgs, grain_morphs, grain_boxes, aspect_ratios = [], [], [], []
+
+    for cnt, area, x, y, bw, bh, ar in valid_grains:
         mask = np.zeros(gray.shape, dtype=np.uint8)
         cv2.drawContours(mask, [cnt], -1, 255, -1)
         mean_int = cv2.mean(gray, mask=mask)[0]
@@ -109,13 +133,9 @@ async def analyze_rice(file: UploadFile = File(...)):
         res = cv2.resize(sq, (64, 64), interpolation=cv2.INTER_AREA)
 
         grain_imgs.append(cv2.cvtColor(res, cv2.COLOR_BGR2RGB))
-        grain_morphs.append([ar, mean_int, area])
+        grain_morphs.append([ar, mean_int, area * area_scale])
         grain_boxes.append((x, y, bw, bh))
         aspect_ratios.append(ar)
-
-    total_grains = len(grain_imgs)
-    if total_grains == 0:
-        return {"error": "Không phát hiện được hạt gạo nào. Vui lòng chụp trên nền đen rõ nét!"}
 
     img_tensor = torch.tensor(np.array(grain_imgs), dtype=torch.float32).permute(0, 3, 1, 2).to(device) / 255.0
     morph_scaled = scaler.transform(np.array(grain_morphs))
